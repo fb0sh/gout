@@ -18,7 +18,7 @@ def log(msg):
     now = datetime.datetime.now()
     timestamp = now.strftime("%Y_%m_%d-%H:%M.") + f"{now.microsecond // 100:04d}"
     # 解释：microsecond//100得到前4位毫秒精度
-    print(f"[gout_server {timestamp}] {msg}")
+    print(f"[gout {timestamp}] {msg}")
 
 
 class ForwardClient:
@@ -28,8 +28,8 @@ class ForwardClient:
         self.host = host
         self.port = port
         self.forward_port = forward_port
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.connect((host, port))
+        self.control_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.control_conn.connect((host, port))
         client_config = {
             "protocol": protocol,
             "port": forward_port,
@@ -37,15 +37,17 @@ class ForwardClient:
         }
 
         try:
-            self.sock.send(json.dumps(client_config).encode())
-            data = json.loads(self.sock.recv(1024).decode())
-            ip = data["ip"]
-            port = data["port"]
-            log(f"forward server: {ip}:{port}")
+            self.control_conn.send(json.dumps(client_config).encode())
+            data = json.loads(self.control_conn.recv(1024).decode())
+            self.server_ip = data["ip"]
+            self.server_port = data["port"]
+            self.data_port = data["data_port"]
+            log(f"forward server: {self.server_ip}:{self.server_port}")
+            log(f"data port: {self.data_port}")
 
         except Exception as e:
             log(f"client config error: {e}")
-            self.sock.close()
+            self.control_conn.close()
             return
 
         self.start_tunnel()
@@ -72,16 +74,45 @@ class ForwardClient:
                 src.close()
                 dst.close()
 
-        log("start tunnel")
-        real_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        def handle_new_connection():
+            """处理每个新连接：连接到服务器数据端口和本地服务"""
+            try:
+                # 连接到服务器数据端口
+                data_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                data_conn.connect((self.host, self.data_port))
 
-        real_srv.connect(("127.0.0.1", self.forward_port))
-        t1 = threading.Thread(target=_fwd, args=(self.sock, real_srv))
-        t2 = threading.Thread(target=_fwd, args=(real_srv, self.sock))
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()  # 阻塞直到两个线程都退出
+                # 连接到本地服务
+                local_conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                local_conn.connect(("127.0.0.1", self.forward_port))
+
+                # 双向转发
+                t1 = threading.Thread(target=_fwd, args=(data_conn, local_conn), daemon=True)
+                t2 = threading.Thread(target=_fwd, args=(local_conn, data_conn), daemon=True)
+                t1.start()
+                t2.start()
+            except Exception as e:
+                log(f"Handle new connection error: {e}")
+
+        log("start tunnel, waiting for connections...")
+
+        # 持续监听控制连接上的通知
+        buffer = b""
+        while True:
+            try:
+                data = self.control_conn.recv(1024)
+                if not data:
+                    log("Control connection closed")
+                    break
+
+                buffer += data
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    if line == b"NEW_CONN":
+                        log("New connection request received")
+                        threading.Thread(target=handle_new_connection, daemon=True).start()
+            except Exception as e:
+                log(f"Control connection error: {e}")
+                break
 
 
 if __name__ == "__main__":

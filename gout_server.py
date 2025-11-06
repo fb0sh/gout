@@ -63,7 +63,7 @@ class ForwardServer:
         self.srv.bind((host, port))
         self.srv.listen(max_connections)
 
-    def start_tunnel(self, client: socket.socket, client_config: dict):
+    def start_tunnel(self, control_conn: socket.socket, client_config: dict):
         def _fwd(src: socket.socket, dst: socket.socket):
             """TCP 双向转发，不使用事件"""
             try:
@@ -86,25 +86,61 @@ class ForwardServer:
                 src.close()
                 dst.close()
 
+        def handle_external_connection(external_conn: socket.socket):
+            """处理每个外部连接：通知客户端并等待数据连接"""
+            try:
+                # 通知客户端有新连接
+                control_conn.sendall(b"NEW_CONN\n")
+
+                # 等待客户端建立数据连接到服务器
+                data_conn, _ = data_srv.accept()
+
+                # 双向转发
+                t1 = threading.Thread(target=_fwd, args=(external_conn, data_conn), daemon=True)
+                t2 = threading.Thread(target=_fwd, args=(data_conn, external_conn), daemon=True)
+                t1.start()
+                t2.start()
+            except Exception as e:
+                log(f"Handle external connection error: {e}")
+                external_conn.close()
+
+        # 创建数据连接监听端口
+        data_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        data_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        data_srv.bind(("0.0.0.0", 0))
+        data_srv.listen(100)
+        data_port = data_srv.getsockname()[1]
+
+        # 创建公网访问端口
         target_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         target_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         free_port = get_free_port(SERVER_CONFIG["min_port"], SERVER_CONFIG["max_port"])
         target_srv.bind(("0.0.0.0", free_port))
-        target_srv.listen(1)
+        target_srv.listen(100)
         log(
-            f"new tunnel {PUBLIC_IP}:{free_port} -> {client.getpeername()[0]}:{client_config['port']}"
+            f"new tunnel {PUBLIC_IP}:{free_port} -> {control_conn.getpeername()[0]}:{client_config['port']}"
         )
-        # first replay
-        client.sendall(json.dumps({"ip": PUBLIC_IP, "port": free_port}).encode())
 
+        # 返回配置给客户端
+        response = {
+            "ip": PUBLIC_IP,
+            "port": free_port,
+            "data_port": data_port
+        }
+        control_conn.sendall(json.dumps(response).encode())
+
+        # 持续接受外部连接
         while True:
-            real_client, _ = target_srv.accept()
-            threading.Thread(
-                target=_fwd, args=(client, real_client), daemon=True
-            ).start()
-            threading.Thread(
-                target=_fwd, args=(real_client, client), daemon=True
-            ).start()
+            try:
+                external_conn, _ = target_srv.accept()
+                threading.Thread(
+                    target=handle_external_connection,
+                    args=(external_conn,),
+                    daemon=True
+                ).start()
+            except Exception as e:
+                log(f"Accept external connection error: {e}")
+                break
 
     def handle_client(self, client: socket.socket):
         data = json.loads(client.recv(1024).decode())
