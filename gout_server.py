@@ -7,7 +7,7 @@ import struct
 import sys
 
 SERVER_CONFIG = {
-    "return_ip": "127.0.0.1",  # 如果在内网，无需获取公网IP
+    "return_ip": None,  # 如果在内网，无需获取公网IP
     "host": "0.0.0.0",
     "port": 3147,
     "verify_password": "passwd@gout",
